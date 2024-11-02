@@ -1,4 +1,3 @@
-# Import necessary libraries
 from datasets import load_dataset
 import pandas as pd
 import random
@@ -33,38 +32,39 @@ def mask_continuous_words(code, mask_ratio=0.1):
         words[i] = ''
     return ' '.join(words)
 
-# Apply masking to canonical solutions
+# masking to  solutions
 masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
 masked_df = pd.DataFrame(masked_prompts, columns=['masked'])
 final_df = pd.concat([original_df, masked_df], axis=1)
 
-# Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_fast=True)
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-70B-Instruct", use_fast=True)
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-70B-Instruct")
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 model = model.to(device)
 
-# Define fix function
+# fix calling GPT function
 def fix(prompt, max_length=200):
-    prompt = "Give me the fixed code without explanation: ```" + prompt + "```"
+    # [TODO] change the prompt, add more missing code
+    # evaluate this code, if wrong, adding one line of code and try again.
+    prompt = "I have the following code:\n\n```"+prompt+"```\n\n It has some missing characters and I don't need any explanation, the original code is:\n\n"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
     outputs = model.generate(**inputs, max_new_tokens=max_length)
     generated_text = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
     return generated_text
 
-# Fix code in masked prompts
+# fix code
 masked_codes = final_df['masked']
 results = []
 for code in tqdm(masked_codes, desc="Fixing code"):
     result = fix(code)
     results.append(result)
 
-# Combine results into DataFrame
+
 results_df = pd.DataFrame(results, columns=['Fixed Code'])
 final_df = pd.concat([final_df, results_df], axis=1)
 
-# Save final DataFrame to CSV
-final_df.to_csv('result.csv', index=False)
+final_df.to_csv('result-Llama-3.1-70B-Instruct.csv', index=False)
 
