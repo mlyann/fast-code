@@ -40,7 +40,7 @@ final_df = pd.concat([original_df, masked_df], axis=1)
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-70B-Instruct", use_fast=True)
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-70B-Instruct")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 model = model.to(device)
 
