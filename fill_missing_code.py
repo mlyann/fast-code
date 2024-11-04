@@ -154,7 +154,6 @@ def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1
     
     mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
-The user is trying to troubleshoot an import error related to importing `load_dataset` from `bigcodebench` and it seems there was a mix-up in the request. However, the provided section to rewrite the code (`return mean_similarity, std_similarity`) does not directly relate to the user's stated problem. It appears the intent was to address the import statement, not the return values in one of the functions. 
     return mean_similarity, std_similarity
 
 # Load results
