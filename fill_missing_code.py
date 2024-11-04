@@ -8,31 +8,40 @@ import os
 import numpy as np
 from dotenv import load_dotenv
 import nltk
-from gensim.models import KeyedVectors
-from gensim.scripts.glove2word2vec import glove2word2vec
+import gensim.downloader as api
 from sklearn.metrics.pairwise import cosine_similarity
 from nltk import word_tokenize
 from nltk.corpus import stopwords
 import matplotlib.pyplot as plt
 
-load_dotenv()
-nltk.download('stopwords')
-nltk.download('punkt')
-
+# Set random seeds for reproducibility
 random.seed(721)
 torch.manual_seed(721)
 np.random.seed(721)
 
-hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
-dataset = load_dataset("openai_humaneval")
+# Set up directories and device
+results_dir = "results-fill-missing"
+plots_dir = "plots"
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+if not os.path.exists(plots_dir):
+    os.makedirs(plots_dir)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-results_dir = "results-fill-missing"
-if not os.path.exists(results_dir):
-    os.makedirs(results_dir)
+# Load necessary libraries and data
+load_dotenv()
+nltk.download('stopwords')
+nltk.download('punkt')
 
+hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
+dataset = load_dataset("openai_humaneval")
+
+# Load GloVe embeddings
+glove_model = api.load("glove-wiki-gigaword-100")
+
+# Prepare data
 num_samples = 164
 data = []
 for i in range(num_samples):
@@ -46,6 +55,7 @@ for i in range(num_samples):
     data.append(sample_data)
 original_df = pd.DataFrame(data)
 
+# Function to mask continuous words
 def mask_continuous_words(code, mask_ratio=0.1):
     words = code.split()
     total_words = len(words)
@@ -55,16 +65,18 @@ def mask_continuous_words(code, mask_ratio=0.1):
         words[i] = ''
     return ' '.join(words)
 
+# Apply masking
 masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
 original_df['masked'] = masked_prompts
 
+# List of models to evaluate
 model_names = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "01-ai/Yi-Coder-9B-Chat",
-    "microsoft/Phi-3-mini-128k-instruct",
-    "google/codegemma-7b"
+    "meta-llama/Llama-3.1-70B-Instruct",
+    "Qwen/Qwen2-72B-Instruct"
 ]
+labels = ['Llama70', 'Qwen72']
 
+# Function to fix code using the models
 def fix(prompt, model, tokenizer, max_length=200):
     prompt = f"Please provide only the code for the following task, without any comments or explanations.\n\nHere is some incomplete code:\n\n```{prompt}```\n\nGive me the complete code, without any further explanation:"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -73,6 +85,7 @@ def fix(prompt, model, tokenizer, max_length=200):
     generated_text = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
     return generated_text
 
+# Process each model
 for model_name in model_names:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -83,61 +96,94 @@ for model_name in model_names:
     file_name = os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")
     original_df.to_csv(file_name, index=False)
 
-# Load GloVe embeddings
-glove_input_file = 'glove.6B.300d.txt'
-word2vec_output_file = 'glove.6B.300d.word2vec.txt'
-
-glove2word2vec(glove_input_file, word2vec_output_file)
-glove_model = KeyedVectors.load_word2vec_format(word2vec_output_file, binary=False)
-
-def text_to_vector(text):
+# Function to convert text to list of vectors
+def text_to_vector_list(text):
     if not isinstance(text, str):
-        return np.zeros(glove_model.vector_size)
+        return []
     words = word_tokenize(text.lower())
     words = [word for word in words if word.isalpha() and word not in stopwords.words('english')]
-    word_vectors = [glove_model[word] for word in words if word in glove_model]
-    return np.mean(word_vectors, axis=0) if word_vectors else np.zeros(glove_model.vector_size)
+    word_vectors = []
+    for word in words:
+        if word in glove_model:
+            vec = glove_model[word]
+            if vec.size > 0:
+                word_vectors.append(vec)
+            else:
+                print(f"Warning: The vector for word '{word}' is empty.")
+        else:
+            print(f"Warning: Word '{word}' not found in the GloVe model.")
+    return word_vectors
 
-def calculate_cosine_similarity(df, column1, column2):
-    vectors1 = df[column1].apply(text_to_vector)
-    vectors2 = df[column2].apply(text_to_vector)
+# Function to calculate max cosine similarity with sliding window
+def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1, column2):
+    vectors1 = df[column1].apply(text_to_vector_list)
+    vectors2 = df[column2].apply(text_to_vector_list)
+    
     similarities = []
-    for vec1, vec2 in zip(vectors1, vectors2):
-        similarity = cosine_similarity([vec1], [vec2])[0][0]
-        similarities.append(similarity)
-    avg_similarity = np.mean(similarities)
+    
+    for vec_list1, vec_list2 in zip(vectors1, vectors2):
+        if len(vec_list1) <= len(vec_list2):
+            shorter_vecs = vec_list1
+            longer_vecs = vec_list2
+        else:
+            shorter_vecs = vec_list2
+            longer_vecs = vec_list1
+        
+        if not shorter_vecs or not longer_vecs:
+            similarities.append(0)
+            continue
+        
+        max_mean_similarity = -1
+        
+        for start in range(len(longer_vecs) - len(shorter_vecs) + 1):
+            sims = []
+            for i in range(len(shorter_vecs)):
+                vec1 = shorter_vecs[i]
+                vec2 = longer_vecs[start + i]
+                if vec1.size == 0 or vec2.size == 0:
+                    print(f"Warning: Encountered empty vector at position {i}.")
+                    continue
+                similarity = cosine_similarity([vec1], [vec2])[0][0]
+                sims.append(similarity)
+            if sims:
+                mean_similarity = np.mean(sims)
+                if mean_similarity > max_mean_similarity:
+                    max_mean_similarity = mean_similarity
+        
+        similarities.append(max_mean_similarity)
+    
+    mean_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
-    return avg_similarity, std_similarity
+The user is trying to troubleshoot an import error related to importing `load_dataset` from `bigcodebench` and it seems there was a mix-up in the request. However, the provided section to rewrite the code (`return mean_similarity, std_similarity`) does not directly relate to the user's stated problem. It appears the intent was to address the import statement, not the return values in one of the functions. 
+    return mean_similarity, std_similarity
 
+# Load results
 results = [pd.read_csv(os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")) for model_name in model_names]
-labels = ['Llama', 'Yi', 'Phi', 'Gemma']
 
+# Evaluate models
 scores, std_devs = [], []
 for df, model_name in zip(results, model_names):
-    avg_sim, std_sim = calculate_cosine_similarity(df, 'canonical_solution', f"Fixed Code ({model_name})")
+    avg_sim, std_sim = calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, 'canonical_solution', f"Fixed Code ({model_name})")
     scores.append(avg_sim)
     std_devs.append(std_sim)
 
+# Evaluate baseline ('masked' column)
+df_baseline = results[0]  # The 'masked' column is the same across all dataframes
+avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(df_baseline, 'canonical_solution', 'masked')
+
+# Append baseline to scores and labels
+scores.append(avg_sim_base)
+std_devs.append(std_sim_base)
+labels.append('Baseline')
+
+# Plot model performance including baseline
 x = np.arange(len(labels))
 fig, ax = plt.subplots()
 ax.bar(x, scores, yerr=std_devs, capsize=5)
 ax.set_xticks(x)
-ax.set_xticklabels(labels)
+ax.set_xticklabels(labels, rotation=45)
 ax.set_ylabel('Cosine Similarity')
-ax.set_title('Fill Missing Code Model Performance Evaluation')
-plt.savefig("fill-missing-code-model_performance_evaluation.png")
-
-scores_base, std_devs_base = [], []
-for df, model_name in zip(results, model_names):
-    avg_sim_base, std_sim_base = calculate_cosine_similarity(df, 'canonical_solution', "masked")
-    scores_base.append(avg_sim_base)
-    std_devs_base.append(std_sim_base)
-
-x = np.arange(len(labels))
-fig, ax = plt.subplots()
-ax.bar(x, scores_base, yerr=std_devs_base, capsize=5)
-ax.set_xticks(x)
-ax.set_xticklabels(labels)
-ax.set_ylabel('Cosine Similarity')
-ax.set_title('Fill Missing Code Baseline')
-plt.savefig("fill_missing_code_baseline.png")
+ax.set_title('Fill Missing Code Model Performance Evaluation - Large Models with Baseline')
+plt.tight_layout()
+plt.savefig("plots/fill-missing-code-model_performance_evaluation-large-models_with_baseline.png")
+plt.show()
