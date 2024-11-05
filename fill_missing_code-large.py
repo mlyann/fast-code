@@ -30,6 +30,7 @@ if not os.path.exists(plots_dir):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+
 # Load necessary libraries and data
 load_dotenv()
 nltk.download('stopwords')
@@ -72,9 +73,9 @@ original_df['masked'] = masked_prompts
 # List of models to evaluate
 model_names = [
     "meta-llama/Llama-3.1-70B-Instruct",
-    "Qwen/Qwen2-72B-Instruct"
+    #"Qwen/Qwen2-72B-Instruct"
 ]
-labels = ['Llama70', 'Qwen72']
+labels = ['Llama70']
 
 # Function to fix code using the models
 def fix(prompt, model, tokenizer, max_length=200):
@@ -88,7 +89,8 @@ def fix(prompt, model, tokenizer, max_length=200):
 # Process each model
 for model_name in model_names:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)#.to(device)
+    #model = model.bfloat16().cuda()
 
     fixed_codes = [fix(code, model, tokenizer) for code in tqdm(original_df['masked'], desc=f"Fixing code with {model_name}")]
     original_df[f"Fixed Code ({model_name})"] = fixed_codes
