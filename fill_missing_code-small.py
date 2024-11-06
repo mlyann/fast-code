@@ -80,7 +80,7 @@ labels = ['Llama', 'Yi', 'Phi', 'Gemma']
 
 # Function to fix code using the models
 def fix(prompt, model, tokenizer, max_length=200):
-    prompt = f"Please provide only the code for the following task, without any comments or explanations.\n\nHere is some incomplete code:\n\n```{prompt}```\n\nGive me the complete code, without any further explanation:"
+    prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n```{prompt}```\n\nPlease provide the completed code:"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
     outputs = model.generate(**inputs, max_new_tokens=max_length)
@@ -90,7 +90,8 @@ def fix(prompt, model, tokenizer, max_length=200):
 # Process each model
 for model_name in model_names:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)#.to(device)
+    #model = model.bfloat16().cuda()
 
     fixed_codes = [fix(code, model, tokenizer) for code in tqdm(original_df['masked'], desc=f"Fixing code with {model_name}")]
     original_df[f"Fixed Code ({model_name})"] = fixed_codes
@@ -187,4 +188,3 @@ ax.set_ylabel('Cosine Similarity')
 ax.set_title('Fill Missing Code Model Performance Evaluation - Small Models with Baseline')
 plt.tight_layout()
 plt.savefig("plots/fill-missing-code-model_performance_evaluation-small-models_with_baseline.png")
-plt.show()

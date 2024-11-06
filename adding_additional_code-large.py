@@ -20,16 +20,15 @@ torch.manual_seed(721)
 np.random.seed(721)
 
 # Set up directories and device
-results_dir = "results-fill-missing"
+results_dir = "results-adding-noise"
 plots_dir = "plots"
 if not os.path.exists(results_dir):
     os.makedirs(results_dir)
 if not os.path.exists(plots_dir):
     os.makedirs(plots_dir)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-
 
 # Load necessary libraries and data
 load_dotenv()
@@ -56,35 +55,31 @@ for i in range(num_samples):
     data.append(sample_data)
 original_df = pd.DataFrame(data)
 
-# Function to mask continuous words
-def mask_continuous_words(code, mask_ratio=0.1):
-    words = code.split(' ')
+# Function to add random words at random positions
+def add_random_words(code, add_ratio=0.1):
+    words = code.split()
     total_words = len(words)
-    num_to_mask = max(1, int(round(total_words * mask_ratio)))
-    start_index = random.randint(0, total_words - num_to_mask)
-    for i in range(start_index, start_index + num_to_mask):
-        words[i] = ''
+    num_to_add = max(1, int(round(total_words * add_ratio)))
+    for _ in range(num_to_add):
+        random_word = random.choice(list(glove_model.key_to_index.keys()))
+        insert_position = random.randint(0, len(words))
+        words.insert(insert_position, random_word)
     return ' '.join(words)
 
-# Apply masking
-masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
-original_df['masked'] = masked_prompts
+# Apply the function to add noise to the code
+noisy_codes = [add_random_words(code) for code in original_df['canonical_solution']]
+original_df['Noisy_Code'] = noisy_codes
 
 # List of models to evaluate
 model_names = [
     "meta-llama/Llama-3.1-70B-Instruct",
-    # "Qwen/Qwen2-72B-Instruct",
-    # "codellama/CodeLlama-70b-Instruct-hf"
+    #"Qwen/Qwen2-72B-Instruct"
 ]
-labels = [
-    'LLaMA3',
-    # 'Qwen72',
-    # 'CodeLlama'
-]
+labels = ['Llama70']
 
 # Function to fix code using the models
 def fix(prompt, model, tokenizer, max_length=200):
-    prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n```{prompt}```\n\nPlease provide the completed code:"
+    prompt = f"Please provide only the code for the following task, without any comments or explanations.\n\nHere is some code with additional noisy characters inserted:\n\n```{prompt}```\n\nGive me the complete code, without any further explanation:"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
     outputs = model.generate(**inputs, max_new_tokens=max_length)
@@ -97,7 +92,7 @@ for model_name in model_names:
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)#.to(device)
     #model = model.bfloat16().cuda()
 
-    fixed_codes = [fix(code, model, tokenizer) for code in tqdm(original_df['masked'], desc=f"Fixing code with {model_name}")]
+    fixed_codes = [fix(code, model, tokenizer) for code in tqdm(original_df['Noisy_Code'], desc=f"Fixing code with {model_name}")]
     original_df[f"Fixed Code ({model_name})"] = fixed_codes
 
     file_name = os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")
@@ -159,9 +154,9 @@ def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1
         
         similarities.append(max_mean_similarity)
     
-    mean_similarity = np.mean(similarities)
+    avg_similarity = np.mean(similarities)
     std_similarity = np.std(similarities)
-    return mean_similarity, std_similarity
+    return avg_similarity, std_similarity
 
 # Load results
 results = [pd.read_csv(os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")) for model_name in model_names]
@@ -173,11 +168,12 @@ for df, model_name in zip(results, model_names):
     scores.append(avg_sim)
     std_devs.append(std_sim)
 
-# Evaluate baseline ('masked' column)
-df_baseline = results[0]  # The 'masked' column is the same across all dataframes
-avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(df_baseline, 'canonical_solution', 'masked')
+# Evaluate baseline (Noisy_Code)
+# Since 'Noisy_Code' is the same across all dataframes, calculate baseline once
+df_baseline = results[0]  # Use the first dataframe
+avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(df_baseline, 'canonical_solution', 'Noisy_Code')
 
-# Append baseline to scores and labels
+# Append the baseline to scores and std_devs
 scores.append(avg_sim_base)
 std_devs.append(std_sim_base)
 labels.append('Baseline')
@@ -189,6 +185,6 @@ ax.bar(x, scores, yerr=std_devs, capsize=5)
 ax.set_xticks(x)
 ax.set_xticklabels(labels, rotation=45)
 ax.set_ylabel('Cosine Similarity')
-ax.set_title('Fill Missing Code Model Performance Evaluation - Large Models with Baseline')
+ax.set_title('Performance Evaluation after Adding Noise - Large Models with Baseline')
 plt.tight_layout()
-plt.savefig("plots/fill-missing-code-model_performance_evaluation-large-models_with_baseline-Llama.png")
+plt.savefig("plots/performance_evaluation_after_adding_noise_with_baseline-large.png")
