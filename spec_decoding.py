@@ -262,7 +262,7 @@ class KVCacheModel():
         self._prob_history = self._prob_history[:, :end_pos, :]
 
     
-def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9, verbose=False):
+def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False):
     input_ids = tokenizer_small.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
     attention_mask = torch.ones_like(input_ids)
 
@@ -282,7 +282,7 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
         x = approx_model_cache.generate(input_ids, gamma)
 
         # Step 2: Generate corresponding logits with the large model
-        _ = target_model_cache.generate(x, 1)
+        _ = target_model_cache.generate(x, gamma)
 
         n = prefix_len + gamma - 1
 
