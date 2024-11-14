@@ -1,20 +1,27 @@
-
-
-import torch
-import numpy as np
-from torch.nn import functional as F
+import time
+from datasets import load_dataset
+import pandas as pd
+import random
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers.models.bloom.modeling_bloom import BloomForCausalLM
+import torch
+import os
+import numpy as np
+from dotenv import load_dotenv
+import nltk
+import gensim.downloader as api
+from sklearn.metrics.pairwise import cosine_similarity
+from nltk import word_tokenize
+from nltk.corpus import stopwords
+import matplotlib.pyplot as plt
+from torch.nn import functional as F
 
-# Set random seed for reproducibility
+
+random.seed(721)
 torch.manual_seed(721)
 np.random.seed(721)
 
-# Initialize device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-# Load small and large models
 tokenizer_small = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", use_fast=True)
 model_small = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device_map="auto"
@@ -181,23 +188,166 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
             if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
                 return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
             input_ids = torch.cat([input_ids, t], dim=1)
+    output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+    print(f"Output: \n{output}")
+    return output
 
-    return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
 
-# # Test example
-# code = (
-#     "for idx, elem in elem2 in enumerate(numbers): "
-#     "if idx != idx2: distance = abs(elem - elem2) "
-#     "if distance < threshold: return True "
-#     "return False"
-# )
-# prompt = (
-#     "Please complete the following incomplete code to match the original solution. "
-#     "Do not add any extra code or function definitions. Only return the completed code, "
-#     "without any comments or explanations.\n\nHere is the code:\n\n"
-#     f"{code}\n\nPlease provide the completed code:"
-# )
 
-# output_text = speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False)
-# print("\nFinal output text:")
-# print(output_text)
+# Set up directories and device
+results_dir = "results-fill-missing"
+plots_dir = "plots"
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+if not os.path.exists(plots_dir):
+    os.makedirs(plots_dir)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# Load necessary libraries and data
+load_dotenv()
+nltk.download('stopwords')
+nltk.download('punkt')
+
+# Load GloVe embeddings
+glove_model = api.load("glove-wiki-gigaword-100")
+
+# Load dataset
+dataset = load_dataset("openai_humaneval")
+
+# Prepare data
+num_samples = len(dataset["test"])  # Use all available samples
+data = []
+for i in range(num_samples):
+    sample_data = {
+        "task_id": dataset["test"][i]["task_id"],
+        "prompt": dataset["test"][i]["prompt"],
+        "canonical_solution": dataset["test"][i]["canonical_solution"],
+        "test": dataset["test"][i]["test"],
+        "entry_point": dataset["test"][i]["entry_point"]
+    }
+    data.append(sample_data)
+original_df = pd.DataFrame(data)
+
+# Function to mask continuous words
+def mask_continuous_words(code, mask_ratio=0.1):
+    words = code.split()
+    total_words = len(words)
+    num_to_mask = max(1, int(round(total_words * mask_ratio)))
+    start_index = random.randint(0, total_words - num_to_mask)
+    for i in range(start_index, start_index + num_to_mask):
+        words[i] = ''
+    return ' '.join(words)
+
+# Apply masking
+masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
+original_df['masked'] = masked_prompts
+
+
+
+# Define speculative_fix function
+def speculative_fix(prompt, 
+                    gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False):
+    prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n{prompt}\n\nPlease provide the completed code:"
+    output_text = speculative_decoding(prompt, gamma, max_length, temperature, top_k, top_p, verbose)
+    return output_text
+
+# Ensure both tokenizers are the same
+assert tokenizer_small.get_vocab() == tokenizer_large.get_vocab(), "Tokenizers do not match!"
+
+# Record time for speculative decoding
+fixed_codes_speculative = []
+speculative_times = []
+
+for code in tqdm(original_df['masked'], desc="Fixing code with Speculative Decoding"):
+    start_time = time.time()
+    fixed_code = speculative_fix(
+        code,gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9, verbose=False
+    )
+    end_time = time.time()
+    fixed_codes_speculative.append(fixed_code)
+    speculative_times.append(end_time - start_time)
+
+# Add the results to the DataFrame
+original_df["Fixed Code (Speculative Decoding)"] = fixed_codes_speculative
+
+# Record average time
+average_speculative_time = sum(speculative_times) / len(speculative_times)
+print(f"Average time per speculative decoding: {average_speculative_time:.2f} seconds")
+
+# Evaluate models
+def text_to_vector_list(text):
+    if not isinstance(text, str):
+        return []
+    words = word_tokenize(text.lower())
+    words = [word for word in words if word.isalpha() and word not in stopwords.words('english')]
+    word_vectors = []
+    for word in words:
+        if word in glove_model:
+            vec = glove_model[word]
+            word_vectors.append(vec)
+    return word_vectors
+
+def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1, column2):
+    vectors1 = df[column1].apply(text_to_vector_list)
+    vectors2 = df[column2].apply(text_to_vector_list)
+    
+    similarities = []
+    
+    for vec_list1, vec_list2 in zip(vectors1, vectors2):
+        if len(vec_list1) == 0 or len(vec_list2) == 0:
+            similarities.append(0)
+            continue
+        
+        shorter_vecs, longer_vecs = (vec_list1, vec_list2) if len(vec_list1) <= len(vec_list2) else (vec_list2, vec_list1)
+        max_mean_similarity = -1
+        
+        for start in range(len(longer_vecs) - len(shorter_vecs) + 1):
+            sims = [
+                cosine_similarity([shorter_vecs[i]], [longer_vecs[start + i]])[0][0]
+                for i in range(len(shorter_vecs))
+            ]
+            mean_similarity = np.mean(sims)
+            if mean_similarity > max_mean_similarity:
+                max_mean_similarity = mean_similarity
+        
+        similarities.append(max_mean_similarity)
+    
+    mean_similarity = np.mean(similarities)
+    std_similarity = np.std(similarities)
+    return mean_similarity, std_similarity
+
+# Evaluate speculative decoding results
+avg_sim_spec, std_sim_spec = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
+    original_df, 'canonical_solution', "Fixed Code (Speculative Decoding)"
+)
+scores = [avg_sim_spec]
+std_devs = [std_sim_spec]
+labels = ['Speculative Decoding']
+
+# Evaluate baseline (masked code)
+avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
+    original_df, 'canonical_solution', 'masked'
+)
+scores.append(avg_sim_base)
+std_devs.append(std_sim_base)
+labels.append('Baseline')
+
+# Plot the results
+x = np.arange(len(labels))
+fig, ax = plt.subplots()
+ax.bar(x, scores, yerr=std_devs, capsize=5)
+ax.set_xticks(x)
+ax.set_xticklabels(labels)
+ax.set_ylabel('Cosine Similarity')
+ax.set_title('Speculative Decoding vs. Baseline Performance')
+plt.tight_layout()
+plt.savefig("plots/speculative_decoding_vs_baseline_performance.png")
+
+# Save the results
+file_name = os.path.join(results_dir, "result-speculative_decoding.csv")
+original_df.to_csv(file_name, index=False)
+
+
+# 24.32 seconds VS 11.50 seconds

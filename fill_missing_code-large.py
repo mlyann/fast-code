@@ -13,6 +13,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from nltk import word_tokenize
 from nltk.corpus import stopwords
 import matplotlib.pyplot as plt
+import time
+
 
 # Set random seeds for reproducibility
 random.seed(721)
@@ -91,17 +93,38 @@ def fix(prompt, model, tokenizer, max_length=200):
     generated_text = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
     return generated_text
 
-# Process each model
+
+# Dictionary to store timing results
+timing_results = {}
+
+# Process each model and calculate time taken
 for model_name in model_names:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)#.to(device)
     #model = model.bfloat16().cuda()
-
+    
+    # Record the start time
+    start_time = time.time()
+    
+    # Perform code fixing
     fixed_codes = [fix(code, model, tokenizer) for code in tqdm(original_df['masked'], desc=f"Fixing code with {model_name}")]
+    
+    # Record the end time and calculate total time
+    end_time = time.time()
+    total_time = end_time - start_time
+    average_time = total_time / len(original_df['masked'])
+    
+    # Save timing results
+    timing_results[model_name] = average_time
     original_df[f"Fixed Code ({model_name})"] = fixed_codes
 
+    # Save results to CSV
     file_name = os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")
     original_df.to_csv(file_name, index=False)
+
+# Print out the average time per sample for each model
+for model_name, avg_time in timing_results.items():
+    print(f"Average time per sample for {model_name}: {avg_time:.2f} seconds")
 
 # Function to convert text to list of vectors
 def text_to_vector_list(text):
