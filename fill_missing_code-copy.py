@@ -16,28 +16,104 @@ from nltk.corpus import stopwords
 import matplotlib.pyplot as plt
 from torch.nn import functional as F
 
-
+# Set random seeds
 random.seed(721)
 torch.manual_seed(721)
 np.random.seed(721)
 
-
-tokenizer_small = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", use_fast=True)
-model_small = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device_map="auto"
-)
-
+# Load large model and tokenizer
 tokenizer_large = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-70B-Instruct", use_fast=True)
 model_large = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.1-70B-Instruct", torch_dtype=torch.float16, device_map="auto"
 )
 
 # Set pad_token_id to eos_token_id to avoid warnings
-tokenizer_small.pad_token_id = tokenizer_small.eos_token_id
 tokenizer_large.pad_token_id = tokenizer_large.eos_token_id
 
-# Ensure both tokenizers are the same
-assert tokenizer_small.get_vocab() == tokenizer_large.get_vocab(), "Tokenizers do not match!"
+# Set up directories and device
+results_dir = "results-fill-missing"
+plots_dir = "plots"
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+if not os.path.exists(plots_dir):
+    os.makedirs(plots_dir)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# Load necessary libraries and data
+load_dotenv()
+nltk.download('stopwords')
+nltk.download('punkt')
+
+# Load GloVe embeddings
+glove_model = api.load("glove-wiki-gigaword-100")
+
+# Load dataset
+dataset = load_dataset("openai_humaneval")
+
+# Prepare data
+num_samples = len(dataset["test"])  # Use all available samples
+data = []
+for i in range(num_samples):
+    sample_data = {
+        "task_id": dataset["test"][i]["task_id"],
+        "prompt": dataset["test"][i]["prompt"],
+        "canonical_solution": dataset["test"][i]["canonical_solution"],
+        "test": dataset["test"][i]["test"],
+        "entry_point": dataset["test"][i]["entry_point"]
+    }
+    data.append(sample_data)
+original_df = pd.DataFrame(data)
+
+# Function to mask continuous words
+def mask_continuous_words(code, mask_ratio=0.1):
+    words = code.split()
+    total_words = len(words)
+    num_to_mask = max(1, int(round(total_words * mask_ratio)))
+    start_index = random.randint(0, total_words - num_to_mask)
+    for i in range(start_index, start_index + num_to_mask):
+        words[i] = ''
+    return ' '.join(words)
+
+# Apply masking
+masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
+original_df['masked'] = masked_prompts
+
+# Knuth-Morris-Pratt (KMP) substring search
+def kmp_search(context_tokens, target_tokens):
+    """Find the first occurrence of target_tokens in context_tokens using KMP algorithm."""
+    n, m = len(context_tokens), len(target_tokens)
+    lps = [0] * m  # Longest prefix suffix array for target_tokens
+    j = 0  # Index for target_tokens
+
+    # Preprocess the target_tokens to create the LPS array
+    i = 1
+    while i < m:
+        if target_tokens[i] == target_tokens[j]:
+            j += 1
+            lps[i] = j
+            i += 1
+        elif j > 0:
+            j = lps[j - 1]
+        else:
+            lps[i] = 0
+            i += 1
+
+    # Search context_tokens for target_tokens using LPS array
+    i, j = 0, 0  # i for context_tokens, j for target_tokens
+    while i < n:
+        if context_tokens[i] == target_tokens[j]:
+            i += 1
+            j += 1
+            if j == m:
+                return i - m  # Found match, return starting index
+        elif j > 0:
+            j = lps[j - 1]
+        else:
+            i += 1
+    return -1  # No match found
+
 
 # Top-k and top-p filtering function
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
@@ -121,160 +197,64 @@ class KVCacheModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False):
-    input_ids = tokenizer_small.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
+
+# Updated copy decoding with copying mechanism
+def copy_decoding_with_copying(prompt, gamma=5, max_length=200, verbose=False):
+    input_ids = tokenizer_large.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
     generated_tokens = []
     seq_len = input_ids.shape[1]
     T = seq_len + max_length
 
-    approx_model_cache = KVCacheModel(model_small, temperature, top_k, top_p)
-    target_model_cache = KVCacheModel(model_large, temperature, top_k, top_p)
+    target_model_cache = KVCacheModel(model_large, temperature=1.0, top_k=0, top_p=0.95)
 
     while input_ids.shape[1] < T:
         prefix_len = input_ids.shape[1]
 
-        # Generate gamma tokens with the small model
-        x = approx_model_cache.generate(input_ids, gamma)
-
-        # Generate corresponding logits with the large model
-        _ = target_model_cache.generate(x, gamma)
-
-        n = prefix_len + gamma - 1
-
-        # Check each token for acceptance
+        # Use copying mechanism to find the next gamma tokens
+        context_tokens = input_ids[0].tolist()
         for i in range(gamma):
-            r = torch.rand(1, device=device)
-            j = x[:, prefix_len + i]
-
-            if j.item() == 0:
-                return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
-
-            q_prob = approx_model_cache._prob_history[:, prefix_len + i - 1, j]
-            p_prob = target_model_cache._prob_history[:, prefix_len + i - 1, j]
-            acceptance_ratio = (p_prob / q_prob).clamp(max=1.0)
-
-            if r < acceptance_ratio:
-                generated_tokens.append(j.item())
-                if verbose:
-                    print(f"Token '{tokenizer_small.decode([j.item()])}' accepted with ratio {acceptance_ratio.item():.2f}")
-                if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
-                    return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+            # Check for matches in the last k tokens of the context
+            k = 10  # Window size for matching
+            match_idx = kmp_search(context_tokens[:prefix_len], context_tokens[prefix_len - k:])
+            
+            if match_idx != -1:
+                # Found a match, copy the next token from the match position
+                next_token = context_tokens[match_idx + k]
             else:
-                if verbose:
-                    print(f"Token '{tokenizer_small.decode([j.item()])}' rejected, will be replaced")
-                n = prefix_len + i - 1
-                break
+                # If no match, generate the next token using the large model
+                q = target_model_cache._forward_with_kvcache(input_ids)
+                next_token = sample(q).item()
+            
+            # Add the next token to the generated sequence
+            generated_tokens.append(next_token)
+            context_tokens.append(next_token)
+            input_ids = torch.cat([input_ids, torch.tensor([[next_token]]).to(device)], dim=1)
 
-        # Update input_ids based on acceptance
-        input_ids = x[:, :n + 1]
-        approx_model_cache.rollback(n + 1)
-        target_model_cache.rollback(n + 1)
-
-        if n < prefix_len + gamma - 1:
-            delta_prob = (target_model_cache._prob_history[:, n, :] - approx_model_cache._prob_history[:, n, :]).clamp(min=0)
-            delta_prob = delta_prob / delta_prob.sum(dim=-1, keepdim=True)
-            t = sample(delta_prob)
-            generated_tokens.append(t.item())
-            if verbose:
-                print(f"Token '{tokenizer_small.decode([x[0, n + 1].item()])}' rejected, replaced with '{tokenizer_large.decode([t.item()])}'")
-            if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
+            # Check for end of sequence
+            if next_token == tokenizer_large.eos_token_id:
                 return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
-            input_ids = torch.cat([input_ids, t], dim=1)
-        else:
-            t = sample(target_model_cache._prob_history[:, -1, :])
-            generated_tokens.append(t.item())
-            if verbose:
-                print(f"Sampling next token: '{tokenizer_large.decode([t.item()])}'")
-            if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
-                return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
-            input_ids = torch.cat([input_ids, t], dim=1)
-    output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
-    print(f"Output: \n{output}")
-    return output
 
+    return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
 
+# Record time for copy decoding
+fixed_codes_copy = []
+copy_times = []
 
-# Set up directories and device
-results_dir = "results-fill-missing"
-plots_dir = "plots"
-if not os.path.exists(results_dir):
-    os.makedirs(results_dir)
-if not os.path.exists(plots_dir):
-    os.makedirs(plots_dir)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-# Load necessary libraries and data
-load_dotenv()
-nltk.download('stopwords')
-nltk.download('punkt')
-
-# Load GloVe embeddings
-glove_model = api.load("glove-wiki-gigaword-100")
-
-# Load dataset
-dataset = load_dataset("openai_humaneval")
-
-# Prepare data
-num_samples = len(dataset["test"])  # Use all available samples
-data = []
-for i in range(num_samples):
-    sample_data = {
-        "task_id": dataset["test"][i]["task_id"],
-        "prompt": dataset["test"][i]["prompt"],
-        "canonical_solution": dataset["test"][i]["canonical_solution"],
-        "test": dataset["test"][i]["test"],
-        "entry_point": dataset["test"][i]["entry_point"]
-    }
-    data.append(sample_data)
-original_df = pd.DataFrame(data)
-
-# Function to mask continuous words
-def mask_continuous_words(code, mask_ratio=0.1):
-    words = code.split()
-    total_words = len(words)
-    num_to_mask = max(1, int(round(total_words * mask_ratio)))
-    start_index = random.randint(0, total_words - num_to_mask)
-    for i in range(start_index, start_index + num_to_mask):
-        words[i] = ''
-    return ' '.join(words)
-
-# Apply masking
-masked_prompts = [mask_continuous_words(code) for code in original_df['canonical_solution']]
-original_df['masked'] = masked_prompts
-
-
-
-# Define speculative_fix function
-def speculative_fix(prompt, 
-                    gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False):
-    prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n{prompt}\n\nPlease provide the completed code:"
-    output_text = speculative_decoding(prompt, gamma, max_length, temperature, top_k, top_p, verbose)
-    return output_text
-
-# Ensure both tokenizers are the same
-assert tokenizer_small.get_vocab() == tokenizer_large.get_vocab(), "Tokenizers do not match!"
-
-# Record time for speculative decoding
-fixed_codes_speculative = []
-speculative_times = []
-
-for code in tqdm(original_df['masked'], desc="Fixing code with Speculative Decoding"):
+for code in tqdm(original_df['masked'], desc="Fixing code with copy Decoding"):
     start_time = time.time()
-    fixed_code = speculative_fix(
-        code,gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9, verbose=False
+    fixed_code = copy_decoding_with_copying(
+        code, gamma=5, max_length=200, verbose=False
     )
     end_time = time.time()
-    fixed_codes_speculative.append(fixed_code)
-    speculative_times.append(end_time - start_time)
+    fixed_codes_copy.append(fixed_code)
+    copy_times.append(end_time - start_time)
 
 # Add the results to the DataFrame
-original_df["Fixed Code (Speculative Decoding)"] = fixed_codes_speculative
+original_df["Fixed Code (copy Decoding)"] = fixed_codes_copy
 
 # Record average time
-average_speculative_time = sum(speculative_times) / len(speculative_times)
-print(f"Average time per speculative decoding: {average_speculative_time:.2f} seconds")
+average_copy_time = sum(copy_times) / len(copy_times)
+print(f"Average time per copy decoding: {average_copy_time:.2f} seconds")
 
 # Evaluate models
 def text_to_vector_list(text):
@@ -318,13 +298,13 @@ def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1
     std_similarity = np.std(similarities)
     return mean_similarity, std_similarity
 
-# Evaluate speculative decoding results
+# Evaluate copy decoding results
 avg_sim_spec, std_sim_spec = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
-    original_df, 'canonical_solution', "Fixed Code (Speculative Decoding)"
+    original_df, 'canonical_solution', "Fixed Code (copy Decoding)"
 )
 scores = [avg_sim_spec]
 std_devs = [std_sim_spec]
-labels = ['Speculative Decoding']
+labels = ['Copy Decoding']
 
 # Evaluate baseline (masked code)
 avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
@@ -341,13 +321,10 @@ ax.bar(x, scores, yerr=std_devs, capsize=5)
 ax.set_xticks(x)
 ax.set_xticklabels(labels)
 ax.set_ylabel('Cosine Similarity')
-ax.set_title('Speculative Decoding vs. Baseline Performance')
+ax.set_title('copy Decoding vs. Baseline Performance')
 plt.tight_layout()
-plt.savefig("plots/speculative_decoding_vs_baseline_performance.png")
+plt.savefig("plots/copy_decoding_vs_baseline_performance.png")
 
 # Save the results
-file_name = os.path.join(results_dir, "result-speculative_decoding.csv")
+file_name = os.path.join(results_dir, "result-copy_decoding.csv")
 original_df.to_csv(file_name, index=False)
-
-
-# 24.32 seconds VS 10.50 seconds

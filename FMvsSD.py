@@ -99,9 +99,9 @@ for model_name in model_names:
     file_name = os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")
     original_df.to_csv(file_name, index=False)
 
-# -------------------- Speculative Decoding Addition -------------------- #
+# -------------------- copy Decoding Addition -------------------- #
 
-# Load small and large models for speculative decoding
+# Load small and large models for copy decoding
 tokenizer_small = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", use_fast=True)
 model_small = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.1-8B-Instruct", torch_dtype=torch.float16, device_map="auto"
@@ -116,7 +116,7 @@ model_large = AutoModelForCausalLM.from_pretrained(
 tokenizer_small.pad_token_id = tokenizer_small.eos_token_id
 tokenizer_large.pad_token_id = tokenizer_large.eos_token_id
 
-# Function for speculative decoding
+# Function for copy decoding
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
     if top_k > 0:
         filter = torch.topk(logits, min(top_k, logits.size(-1)))[0]
@@ -217,7 +217,7 @@ class KVCacheModel():
         self._past_key_values = past_key_values_trimmed
         self._prob_history = self._prob_history[:, :end_pos, :]
 
-def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95):
+def copy_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95):
     input_ids = tokenizer_small.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
     attention_mask = torch.ones_like(input_ids)
 
@@ -277,34 +277,34 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
     output_text = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
     return output_text
 
-# Timer function for speculative decoding
-def timed_speculative_decoding(prompt, **kwargs):
+# Timer function for copy decoding
+def timed_copy_decoding(prompt, **kwargs):
     start_time = time.time()
-    output_text = speculative_decoding(prompt, **kwargs)
+    output_text = copy_decoding(prompt, **kwargs)
     elapsed_time = time.time() - start_time
     return output_text, elapsed_time
 
-# Record times and outputs for speculative decoding
-speculative_times = []
-speculative_outputs = []
+# Record times and outputs for copy decoding
+copy_times = []
+copy_outputs = []
 
-# Prepare prompts for speculative decoding
-speculative_prompts = []
+# Prepare prompts for copy decoding
+copy_prompts = []
 for code in original_df['masked']:
     prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n```{code}```\n\nPlease provide the completed code:"
-    speculative_prompts.append(prompt)
+    copy_prompts.append(prompt)
 
-# Run speculative decoding and record outputs and times
-for prompt in tqdm(speculative_prompts, desc="Speculative Decoding"):
-    output_text, elapsed_time = timed_speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9)
-    speculative_outputs.append(output_text)
-    speculative_times.append(elapsed_time)
+# Run copy decoding and record outputs and times
+for prompt in tqdm(copy_prompts, desc="copy Decoding"):
+    output_text, elapsed_time = timed_copy_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9)
+    copy_outputs.append(output_text)
+    copy_times.append(elapsed_time)
 
-# Add speculative decoding outputs to DataFrame
-original_df['Fixed Code (Speculative)'] = speculative_outputs
+# Add copy decoding outputs to DataFrame
+original_df['Fixed Code (copy)'] = copy_outputs
 
 # Save results to CSV
-file_name = os.path.join(results_dir, "result-Speculative_Decoding.csv")
+file_name = os.path.join(results_dir, "result-copy_Decoding.csv")
 original_df.to_csv(file_name, index=False)
 
 # -------------------- Evaluation and Plotting -------------------- #
@@ -372,10 +372,10 @@ def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1
 
 # Load results
 results = [pd.read_csv(os.path.join(results_dir, f"result-{model_name.replace('/', '-')}.csv")) for model_name in model_names]
-results.append(pd.read_csv(os.path.join(results_dir, "result-Speculative_Decoding.csv")))
+results.append(pd.read_csv(os.path.join(results_dir, "result-copy_Decoding.csv")))
 
-# Update labels to include speculative decoding
-labels = ['Llama', 'Yi', 'Phi', 'Gemma', 'Speculative']
+# Update labels to include copy decoding
+labels = ['Llama', 'Yi', 'Phi', 'Gemma', 'copy']
 
 # Evaluate models
 scores, std_devs = [], []
@@ -400,16 +400,16 @@ ax.bar(x, scores, yerr=std_devs, capsize=5)
 ax.set_xticks(x)
 ax.set_xticklabels(labels, rotation=45)
 ax.set_ylabel('Cosine Similarity')
-ax.set_title('Fill Missing Code Model Performance Evaluation - Including Speculative Decoding')
+ax.set_title('Fill Missing Code Model Performance Evaluation - Including copy Decoding')
 plt.tight_layout()
-plt.savefig("plots/fill-missing-code-model_performance_evaluation-with-speculative-decoding.png")
+plt.savefig("plots/fill-missing-code-model_performance_evaluation-with-copy-decoding.png")
 
 # Record times for original models (assuming you have recorded them)
 # For demonstration, I'll initialize empty lists
 times_original_models = [[] for _ in model_names]  # Replace with your actual timing lists
 
-# Record times for speculative decoding
-times_speculative = speculative_times
+# Record times for copy decoding
+times_copy = copy_times
 
 # Ensure all timing lists are of length 164
 # times_original_models = [your_times_list_for_each_model]  # Replace with actual data
@@ -421,12 +421,12 @@ for times in times_original_models:
     average_times.append(np.mean(times))
     average_times_std.append(np.std(times))
 
-# Append speculative decoding times
-average_times.append(np.mean(times_speculative))
-average_times_std.append(np.std(times_speculative))
+# Append copy decoding times
+average_times.append(np.mean(times_copy))
+average_times_std.append(np.std(times_copy))
 
-# Update labels to include speculative decoding
-labels_time = ['Llama', 'Yi', 'Phi', 'Gemma', 'Speculative']
+# Update labels to include copy decoding
+labels_time = ['Llama', 'Yi', 'Phi', 'Gemma', 'copy']
 
 # Plot timing comparison
 x = np.arange(len(labels_time))
@@ -435,8 +435,8 @@ ax.bar(x, average_times, yerr=average_times_std, capsize=5)
 ax.set_xticks(x)
 ax.set_xticklabels(labels_time, rotation=45)
 ax.set_ylabel('Average Time (s)')
-ax.set_title('Average Generation Time Comparison - Including Speculative Decoding')
+ax.set_title('Average Generation Time Comparison - Including copy Decoding')
 plt.tight_layout()
-plt.savefig('plots/generation_time_comparison_with_speculative_decoding.png')
+plt.savefig('plots/generation_time_comparison_with_copy_decoding.png')
 
 # Optionally, you can also plot per-sample times if you have the data
