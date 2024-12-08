@@ -147,7 +147,8 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
             j = x[:, prefix_len + i]
 
             if j.item() == 0:
-                return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                return output, len(generated_tokens)
 
             q_prob = approx_model_cache._prob_history[:, prefix_len + i - 1, j]
             p_prob = target_model_cache._prob_history[:, prefix_len + i - 1, j]
@@ -158,7 +159,8 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
                 if verbose:
                     print(f"Token '{tokenizer_small.decode([j.item()])}' accepted with ratio {acceptance_ratio.item():.2f}")
                 if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
-                    return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                    output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                    return output, len(generated_tokens)
             else:
                 if verbose:
                     print(f"Token '{tokenizer_small.decode([j.item()])}' rejected, will be replaced")
@@ -178,7 +180,8 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
             if verbose:
                 print(f"Token '{tokenizer_small.decode([x[0, n + 1].item()])}' rejected, replaced with '{tokenizer_large.decode([t.item()])}'")
             if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
-                return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                return output, len(generated_tokens)
             input_ids = torch.cat([input_ids, t], dim=1)
         else:
             t = sample(target_model_cache._prob_history[:, -1, :])
@@ -186,11 +189,12 @@ def speculative_decoding(prompt, gamma=5, max_length=200, temperature=1.0, top_k
             if verbose:
                 print(f"Sampling next token: '{tokenizer_large.decode([t.item()])}'")
             if tokenizer_large.decode([generated_tokens[-1]]) == '<|eot_id|>':
-                return tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
+                return output, len(generated_tokens)
             input_ids = torch.cat([input_ids, t], dim=1)
     output = tokenizer_large.decode(generated_tokens, skip_special_tokens=True)
     print(f"Output: \n{output}")
-    return output
+    return output, len(generated_tokens)
 
 
 
@@ -250,8 +254,8 @@ original_df['masked'] = masked_prompts
 def speculative_fix(prompt, 
                     gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.95, verbose=False):
     prompt = f"Please complete the following incomplete code to match the original solution. Do not add any extra code or function definitions. Only return the completed code, without any comments or explanations.\n\nHere is the code:\n\n{prompt}\n\nPlease provide the completed code:"
-    output_text = speculative_decoding(prompt, gamma, max_length, temperature, top_k, top_p, verbose)
-    return output_text
+    output_text, num_tokens = speculative_decoding(prompt, gamma, max_length, temperature, top_k, top_p, verbose)
+    return output_text, num_tokens
 
 # Ensure both tokenizers are the same
 assert tokenizer_small.get_vocab() == tokenizer_large.get_vocab(), "Tokenizers do not match!"
@@ -259,22 +263,26 @@ assert tokenizer_small.get_vocab() == tokenizer_large.get_vocab(), "Tokenizers d
 # Record time for speculative decoding
 fixed_codes_speculative = []
 speculative_times = []
+speculative_tokens_counts = []
 
 for code in tqdm(original_df['masked'], desc="Fixing code with Speculative Decoding"):
     start_time = time.time()
-    fixed_code = speculative_fix(
-        code,gamma=5, max_length=200, temperature=1.0, top_k=0, top_p=0.9, verbose=False
+    fixed_code, num_tokens = speculative_fix(
+        code,gamma=5, max_length=200, temperature=1.0, top_k=20, top_p=0.9, verbose=False
     )
     end_time = time.time()
     fixed_codes_speculative.append(fixed_code)
     speculative_times.append(end_time - start_time)
+    speculative_tokens_counts.append(num_tokens)
 
 # Add the results to the DataFrame
 original_df["Fixed Code (Speculative Decoding)"] = fixed_codes_speculative
 
-# Record average time
-average_speculative_time = sum(speculative_times) / len(speculative_times)
-print(f"Average time per speculative decoding: {average_speculative_time:.2f} seconds")
+# Calculate average tokens per second
+total_tokens = sum(speculative_tokens_counts)
+total_time = sum(speculative_times)
+average_tokens_per_second = total_tokens / total_time
+print(f"Average tokens per second: {average_tokens_per_second:.2f} tokens/second")
 
 # Evaluate models
 def text_to_vector_list(text):
@@ -348,6 +356,5 @@ plt.savefig("plots/speculative_decoding_vs_baseline_performance.png")
 # Save the results
 file_name = os.path.join(results_dir, "result-speculative_decoding.csv")
 original_df.to_csv(file_name, index=False)
-
 
 # 24.32 seconds VS 10.50 seconds

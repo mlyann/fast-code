@@ -114,90 +114,6 @@ def kmp_search(context_tokens, target_tokens):
             i += 1
     return -1  # No match found
 
-
-# Top-k and top-p filtering function
-def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
-    if top_k > 0:
-        filter = torch.topk(logits, min(top_k, logits.size(-1)))[0]
-        logits[logits < filter[:, [-1]]] = float('-inf')
-    if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        filter = cumulative_probs > top_p
-        filter[..., 1:] = filter[..., :-1].clone()
-        filter[..., 0] = 0
-        indices_to_remove = filter.scatter(1, sorted_indices, filter)
-        logits[indices_to_remove] = float('-inf')
-    return logits
-
-def norm_logits(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
-    logits = logits / temperature
-    logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
-    probs = F.softmax(logits, dim=1)
-    return probs
-
-def sample(probs: torch.Tensor, num_samples: int = 1) -> torch.Tensor:
-    idx_next = torch.multinomial(probs, num_samples=num_samples)
-    return idx_next
-
-class KVCacheModel():
-    def __init__(self, model: torch.nn.Module, temperature: float = 1, top_k: int = 0, top_p: float = 0):
-        self._model = model
-        self._past_key_values = None
-        self._prob_history = None
-        self._temperature = temperature
-        self._top_k = top_k
-        self._top_p = top_p
-
-    def _forward_with_kvcache(self, input_ids: torch.Tensor, use_debug: bool = True) -> torch.Tensor:
-        if self._past_key_values is None:
-            outputs = self._model(input_ids)
-            self._prob_history = outputs.logits
-            for i in range(self._prob_history.shape[-2]):   
-                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], self._temperature, self._top_k, self._top_p)
-            self._past_key_values = outputs.past_key_values
-            last_q = self._prob_history[:, -1, :]
-        else:
-            cached_len = self._past_key_values[0][0].shape[2]
-            last_input_id = input_ids[:, cached_len:]
-            if last_input_id.dim() == 1:
-                last_input_id = torch.unsqueeze(last_input_id, 0)
-            outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
-            not_cached_q = outputs.logits
-            if not_cached_q.dim() == 2:
-                not_cached_q = torch.unsqueeze(not_cached_q, 0)
-            for i in range(not_cached_q.shape[-2]):   
-                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], self._temperature, self._top_k, self._top_p)    
-            self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
-            last_q = not_cached_q[:, -1, :]
-            self._past_key_values = outputs.past_key_values
-        return last_q
-
-    def _generate_with_kvcache(self, prefix: torch.Tensor, gamma: int, use_debug=False) -> torch.Tensor:
-        x = prefix
-        for _ in range(gamma):
-            q = self._forward_with_kvcache(x, use_debug)
-            next_tok = sample(q)
-            x = torch.cat((x, next_tok), dim=1)
-        return x
-
-    @torch.no_grad()
-    def generate(self, input: torch.Tensor, gamma: int) -> torch.Tensor:
-        output = self._generate_with_kvcache(input, gamma)
-        return output
-    
-    @torch.no_grad()
-    def rollback(self, end_pos: int):
-        past_key_values_trimmed = []
-        for kv in self._past_key_values:
-            k, v = kv
-            k = k[:, :, :end_pos, :]
-            v = v[:, :, :end_pos, :]
-            past_key_values_trimmed.append((k, v))
-        self._past_key_values = past_key_values_trimmed
-        self._prob_history = self._prob_history[:, :end_pos, :]
-
-
 # Updated copy decoding with copying mechanism
 def copy_decoding_with_copying(prompt, gamma=5, max_length=200, verbose=False):
     input_ids = tokenizer_large.encode(prompt, return_tensors="pt", add_special_tokens=False).to(device)
@@ -217,11 +133,11 @@ def copy_decoding_with_copying(prompt, gamma=5, max_length=200, verbose=False):
             k = 10  # Window size for matching
             match_idx = kmp_search(context_tokens[:prefix_len], context_tokens[prefix_len - k:])
             
-            if match_idx != -1:
+            if match_idx != -1 and match_idx + k < len(context_tokens):
                 # Found a match, copy the next token from the match position
                 next_token = context_tokens[match_idx + k]
             else:
-                # If no match, generate the next token using the large model
+                # If no match or out of bounds, generate the next token using the large model
                 q = target_model_cache._forward_with_kvcache(input_ids)
                 next_token = sample(q).item()
             
@@ -255,76 +171,3 @@ original_df["Fixed Code (copy Decoding)"] = fixed_codes_copy
 # Record average time
 average_copy_time = sum(copy_times) / len(copy_times)
 print(f"Average time per copy decoding: {average_copy_time:.2f} seconds")
-
-# Evaluate models
-def text_to_vector_list(text):
-    if not isinstance(text, str):
-        return []
-    words = word_tokenize(text.lower())
-    words = [word for word in words if word.isalpha() and word not in stopwords.words('english')]
-    word_vectors = []
-    for word in words:
-        if word in glove_model:
-            vec = glove_model[word]
-            word_vectors.append(vec)
-    return word_vectors
-
-def calculate_max_cosine_similarity_word_by_word_with_sliding_window(df, column1, column2):
-    vectors1 = df[column1].apply(text_to_vector_list)
-    vectors2 = df[column2].apply(text_to_vector_list)
-    
-    similarities = []
-    
-    for vec_list1, vec_list2 in zip(vectors1, vectors2):
-        if len(vec_list1) == 0 or len(vec_list2) == 0:
-            similarities.append(0)
-            continue
-        
-        shorter_vecs, longer_vecs = (vec_list1, vec_list2) if len(vec_list1) <= len(vec_list2) else (vec_list2, vec_list1)
-        max_mean_similarity = -1
-        
-        for start in range(len(longer_vecs) - len(shorter_vecs) + 1):
-            sims = [
-                cosine_similarity([shorter_vecs[i]], [longer_vecs[start + i]])[0][0]
-                for i in range(len(shorter_vecs))
-            ]
-            mean_similarity = np.mean(sims)
-            if mean_similarity > max_mean_similarity:
-                max_mean_similarity = mean_similarity
-        
-        similarities.append(max_mean_similarity)
-    
-    mean_similarity = np.mean(similarities)
-    std_similarity = np.std(similarities)
-    return mean_similarity, std_similarity
-
-# Evaluate copy decoding results
-avg_sim_spec, std_sim_spec = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
-    original_df, 'canonical_solution', "Fixed Code (copy Decoding)"
-)
-scores = [avg_sim_spec]
-std_devs = [std_sim_spec]
-labels = ['Copy Decoding']
-
-# Evaluate baseline (masked code)
-avg_sim_base, std_sim_base = calculate_max_cosine_similarity_word_by_word_with_sliding_window(
-    original_df, 'canonical_solution', 'masked'
-)
-scores.append(avg_sim_base)
-std_devs.append(std_sim_base)
-labels.append('Baseline')
-
-# Plot the results
-x = np.arange(len(labels))
-fig, ax = plt.subplots()
-ax.bar(x, scores, yerr=std_devs, capsize=5)
-ax.set_xticks(x)
-ax.set_xticklabels(labels)
-ax.set_ylabel('Cosine Similarity')
-ax.set_title('copy Decoding vs. Baseline Performance')
-plt.tight_layout()
-plt.savefig("plots/copy_decoding_vs_baseline_performance.png")
-
-# Save the results
-file_name = os.path.join(results_dir, "result-copy_decoding.csv")
-original_df.to_csv(file_name, index=False)
